@@ -108,10 +108,7 @@ note('testing append survives flock EBADF (NFS without lockd)...');
 
     my @warns = grep { $_->{level} eq 'warn' } @$messages;
     is( scalar @warns, 1, 'exactly one warn emitted across multiple appends' );
-
-    if ( $log->can('flock_disabled') ) {
-        ok( $log->flock_disabled, 'flock_disabled flipped to truthy' );
-    }
+    ok( $log->flock_disabled, 'flock_disabled flipped to truthy' );
 }
 
 # --- same as above but ENOLCK (newer kernels' errno for missing lock manager) ---
@@ -145,6 +142,7 @@ note('testing append survives flock ENOLCK...');
 
     my @warns = grep { $_->{level} eq 'warn' } @$messages;
     is( scalar @warns, 1, 'exactly one warn emitted on ENOLCK' );
+    ok( $log->flock_disabled, 'flock_disabled flipped to truthy on ENOLCK' );
 }
 
 # --- lockpath + logpath both on NFS: 5 appends survive, one warn total ---
@@ -264,6 +262,54 @@ SKIP: {
     } );
     ok( $survived, 'info() did not die under flock-EBADF' )
       or diag("info die was: $err");
+}
+
+# --- _try_flock with non-NFS errno does not set flock_disabled ---
+note('testing _try_flock with non-NFS errno does not set flock_disabled...');
+{
+    my ( $log, $logpath ) = fresh_logger();
+    use Errno qw(EAGAIN);
+
+    local $mock_flock_behavior = sub {
+        my ( $fh, $op ) = @_;
+        return ( 1, undef ) if ( $op & LOCK_UN );
+        return ( 0, EAGAIN );
+    };
+
+    with_suppressed_stdout( sub {
+        eval { $log->info("contended") };
+    } );
+    ok( !$log->flock_disabled,
+        'flock_disabled stays false on non-NFS errno (lock contention)' );
+}
+
+# --- ensure_lock reopens lockfh after fork (simulated PID mismatch) ---
+note('testing ensure_lock reopens lockfh after simulated fork...');
+{
+    my ( $log, $logpath, $dir ) = fresh_logger();
+
+    my $original_fh = $log->lockfh;
+
+    $log->lockpid( $$ + 99999 );
+    LANraragi::Utils::RotatingLog::ensure_lock($log);
+
+    isnt( $log->lockfh, $original_fh,
+        'ensure_lock opened a new filehandle after PID mismatch' );
+    is( $log->lockpid, $$,
+        'lockpid updated to current PID after ensure_lock' );
+}
+
+# --- ensure_lock uses +>> (lockfh is readable after re-open) ---
+note('testing ensure_lock lockfh is readable after re-open (+>> mode)...');
+{
+    my ( $log, $logpath, $dir ) = fresh_logger();
+
+    $log->lockpid( $$ + 1 );
+    LANraragi::Utils::RotatingLog::ensure_lock($log);
+
+    my $buf = '';
+    my $read_ok = defined( read( $log->lockfh, $buf, 1 ) );
+    ok( $read_ok, 'lockfh is readable after ensure_lock re-open (+>> mode)' );
 }
 
 done_testing();
